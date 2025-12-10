@@ -1,0 +1,263 @@
+/*
+- controls a servo using wifi webpage commands
+- ESPNOW communication between both ESPs
+   - receives 0/1 from S3
+   - sends 0/1 to S3
+- if unlocked for 10 seconds, auto lock
+- MACs
+   - C6 is A0:85:E3:DA:BD:58
+   - S3 is 3C:84:27:15:9C:08
+*/
+
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>
+
+#define SERVO_PIN 5   // servo pin on GPIO5
+
+// wifi soft access point
+const char* ssid = "Smart Door Lock";
+const char* password = "lock1234";
+
+WiFiServer server(80); // web server port number to 80
+String header; // var to store HTTP request data
+
+// servo configuration
+Servo doorServo;
+const int LOCK_POSITION   = 0;
+const int UNLOCK_POSITION = 90;
+
+// door state variable
+bool doorLocked = true; // true means locked
+String doorStateStr = "Locked";
+
+// if the door is unlocked for 10 seconds, it will automatically lock the door
+unsigned long unlockTime = 0;
+bool autoLockEnabled = false;
+const unsigned long AUTO_LOCK_DELAY = 10000; // 10 sec
+
+uint8_t S3_MAC[] = {0x3C, 0x84, 0x27, 0x15, 0x9C, 0x08}; // ESPNOW peer
+
+void printMyMac() {
+  uint8_t mac[6];
+  if (esp_wifi_get_mac(WIFI_IF_AP, mac) == ESP_OK) {
+    Serial.printf("C6 AP MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  }
+  if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+    Serial.printf("C6 STA MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  }
+}
+
+// called after sending ESPNOW data - prints whether the transmit was a success or failure
+void onDataSent(const esp_now_send_info_t *info, esp_now_send_status_t status) {
+  Serial.print("ESPNOW send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+// callback that processes a received ESPNOW lock/unlock command and updates the door state
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len < 1) return;
+  uint8_t val = data[0];
+  bool receivedLocked = (val == 1);
+
+  Serial.print("ESPNOW received: ");
+  Serial.println(receivedLocked ? "LOCK" : "UNLOCK");
+
+  if (receivedLocked != doorLocked) {
+    doorLocked = receivedLocked;
+    doorStateStr = doorLocked ? "Locked" : "Unlocked";
+
+    if (doorLocked) {
+      // send PWM signal to servo to rotate to locked position
+      doorServo.write(LOCK_POSITION);
+      autoLockEnabled = false;
+      Serial.println("Servo: LOCK");
+    } else {
+      // send PWM signal to servo to rotate to unlocked position
+      doorServo.write(UNLOCK_POSITION);
+      unlockTime = millis();
+      autoLockEnabled = true;
+      Serial.println("Servo: UNLOCK");
+    }
+
+    // notify S3 back (confirmation)
+    uint8_t out = doorLocked ? 1 : 0;
+    esp_now_send(S3_MAC, &out, 1);
+  }
+}
+
+// sends current lock/unlock state to S3 so both devices stay in sync
+void sendStatus() {
+  uint8_t payload = doorLocked ? 1 : 0;
+  esp_err_t r = esp_now_send(S3_MAC, &payload, 1);
+  if (r != ESP_OK) {
+    Serial.printf("esp_now_send error: %d\n", r);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // initialize servo in the locked position when the device first powers on
+  doorServo.attach(SERVO_PIN);
+  doorServo.write(LOCK_POSITION);
+  doorLocked = true;
+  doorStateStr = "Locked";
+
+  // start wifi in both AP and STA mode so the ESP can host the webpage and ESP-NOW
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid, password);
+  delay(200);
+  server.begin();
+
+  Serial.print("AP IP Address: ");
+  Serial.println(WiFi.softAPIP());
+
+  printMyMac(); // print both MAC addresses
+
+  // initialize ESPNOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESPNOW init failed");
+  } else {
+    // register functions that run whenever a message is sent or received
+    esp_now_register_send_cb(onDataSent);
+    esp_now_register_recv_cb(onDataRecv);
+
+    // configure S3 as a peer device we can send messages to
+    esp_now_peer_info_t peerInfo;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, S3_MAC, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("Failed to add S3");
+    } else {
+      Serial.println("S3 added");
+    }
+  }
+
+  Serial.println("ESP32C6 ready: Web UI + ESPNOW running"); // final confirmation that everything is running
+}
+
+// main webpage UI
+void sendMainPage(WiFiClient &client) {
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-type:text/html");
+  client.println("Connection: close");
+  client.println();
+  client.println("<!DOCTYPE html><html><head>");
+  client.println("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+
+  client.println("<script>");
+  client.println("setInterval(() => {");
+  client.println("fetch('/state').then(r => r.text()).then(state => {");
+  client.println("document.getElementById('doorState').innerText = state;");
+  client.println("if (state === 'Locked') {");
+  client.println("document.getElementById('lockBtn').style.display = 'none';");
+  client.println("document.getElementById('unlockBtn').style.display = 'block';");
+  client.println("} else {");
+  client.println("document.getElementById('lockBtn').style.display = 'block';");
+  client.println("document.getElementById('unlockBtn').style.display = 'none';");
+  client.println("}");
+  client.println("});}, 1000);");
+  client.println("</script>");
+
+  client.println("<style>");
+  client.println("html { font-family: Helvetica; text-align: center; }");
+  client.println(".button { padding: 16px 40px; font-size: 30px; border: none; color: white; cursor: pointer; }");
+  client.println(".unlockBtn { background-color: #4CAF50; }");
+  client.println(".lockBtn { background-color: #FF3333; }");
+  client.println("</style>");
+
+  client.println("</head><body>");
+  client.println("<h1>Smart Door Lock</h1>");
+  client.println("<p>The door is <b id='doorState'>" + doorStateStr + "</b></p>");
+
+  client.println("<p id='unlockBtn' style='display:" + String(doorStateStr == "Locked" ? "block" : "none") + ";'>");
+  client.println("<a href=\"/unlock\"><button class=\"button unlockBtn\">Unlock Door</button></a></p>");
+
+  client.println("<p id='lockBtn' style='display:" + String(doorStateStr == "Unlocked" ? "block" : "none") + ";'>");
+  client.println("<a href=\"/lock\"><button class=\"button lockBtn\">Lock Door</button></a></p>");
+
+  client.println("</body></html>");
+}
+
+/*
+- handles auto-locking
+- listens for webpage requests
+- updates the door/servo 
+- notifies the S3 whenever the user locks or unlocks the door through the browser
+*/
+void loop() {
+  if (autoLockEnabled && (millis() - unlockTime >= AUTO_LOCK_DELAY)) {
+    Serial.println("Auto-lock triggered");
+    doorStateStr = "Locked";
+    doorLocked = true;
+    doorServo.write(LOCK_POSITION);
+    autoLockEnabled = false;
+    sendStatus(); // notify S3
+  }
+
+  WiFiClient client = server.available();
+  if (!client) {
+    delay(10);
+    return;
+  }
+
+  Serial.println("New web client connected");
+  String curr = "";
+  header = "";
+
+  while (client.connected()) {
+    if (client.available()) {
+      char c = client.read();
+      header += c;
+
+      if (header.indexOf("GET /state") >= 0) {
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: text/plain");
+        client.println("Connection: close");
+        client.println();
+        client.print(doorStateStr);
+        break;
+      }
+
+      if (c == '\n') {
+        if (curr.length() == 0) {
+
+          if (header.indexOf("GET /unlock") >= 0) {
+            Serial.println("Web: Unlock received");
+            doorStateStr = "Unlocked";
+            doorLocked = false;
+            doorServo.write(UNLOCK_POSITION);
+            unlockTime = millis();
+            autoLockEnabled = true;
+            sendStatus();
+          }
+
+          if (header.indexOf("GET /lock") >= 0) {
+            Serial.println("Web: Lock received");
+            doorStateStr = "Locked";
+            doorLocked = true;
+            doorServo.write(LOCK_POSITION);
+            autoLockEnabled = false;
+            sendStatus(); // notify S3
+          }
+
+          sendMainPage(client);
+          break;
+        }
+        curr = "";
+      } else if (c != '\r') {
+        curr += c;
+      }
+    }
+  }
+
+  client.stop();
+  Serial.println("Client Disconnected\n");
+}
