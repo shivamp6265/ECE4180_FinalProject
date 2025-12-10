@@ -1,0 +1,220 @@
+//LCD Configuration file is included to set have the pins set.
+#include "LGFX_Config.h"
+LGFX lcd;
+
+#include <Wire.h>
+#include <SPI.h>
+#include <Arduino.h>
+#include "TouchDrvFT6X36.hpp"
+
+//Wifi setup
+#include <WiFi.h>
+#include <esp_now.h>
+
+//Touch-screen interrupt pins
+#define TP_SDA  6
+#define TP_SCL  5
+#define TP_INT  7
+
+TouchDrvFT6X36 tp;
+volatile bool touchIRQ = false; 
+bool doorLocked = true;
+bool lastReceivedState = true; //used to not get into an infinite loop
+
+unsigned long lastTouchTime = 0; //timer that will count up to the sleep timeout
+const unsigned long sleep_timeout = 30000; // After 30 seconds, the thing will go into sleep mode
+
+
+const unsigned long AUTOLOCK_DELAY = 10000; //After 10 seconds, the door will autolock
+unsigned long unlockTime = 0; //counter that starts once the door is unlocked
+
+
+
+typedef struct {
+  bool doorLocked;
+} doorPacket;
+
+doorPacket outgoingPacket;
+doorPacket incomingPacket;
+
+uint8_t peerAddress[] = {0xA0, 0x85, 0xE3, 0xDA, 0xBD, 0x58};
+//A0:85:E3:DA:BD:58
+
+//Interrupt setup
+void IRAM_ATTR touch_isr(void *arg) {
+    touchIRQ = true;
+}
+
+//Draw the lock screen, colors seem to be inverted for some reason on the LCD screen despite having been configured in the configure file which is why they are flipped
+void drawLocked() {
+  lcd.fillScreen(0xFFFFFF);
+  lcd.setTextColor(0x0000, 0xFFFFFF);
+  lcd.setTextSize(4);
+  lcd.drawCenterString("DOOR LOCKED", lcd.width() / 2, 40);
+  lcd.fillRoundRect(40, 140, lcd.width() - 80, 120, 16, 0x00FFFF); 
+  lcd.setTextColor(0x0000);
+  lcd.setTextSize(3);
+  lcd.drawCenterString("Press to Unlock Door", lcd.width() / 2, 180);
+}
+
+//Draw the unlock screen
+void drawUnlocked() {
+  lcd.fillScreen(0x0000);
+  lcd.setTextColor(0xFFFFFF, 0x0000);
+  lcd.setTextSize(4);
+  lcd.drawCenterString("DOOR UNLOCKED", lcd.width() / 2, 40);
+  lcd.fillRoundRect(40, 140, lcd.width() - 80, 120, 16, 0x800080); 
+  lcd.setTextColor(0xFFFFFF);
+  lcd.setTextSize(3);
+  lcd.drawCenterString("Press to Lock Door", lcd.width() / 2, 180);
+}
+
+
+//parse the data sent
+void onDataSent(const esp_now_send_info_t *info, esp_now_send_status_t status) {
+  Serial.print("Send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+//parse data recieved
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len < (int)sizeof(incomingPacket)) return;
+
+  memcpy(&incomingPacket, data, sizeof(incomingPacket));
+  //get the boolean state
+  bool newState = incomingPacket.doorLocked;
+
+  // Only update UI/state if it actually changed
+  if (newState != doorLocked) {
+    doorLocked = newState;
+    Serial.println(newState ? "Received: Locked" : "Received: Unlocked");
+
+    if (doorLocked) {
+      drawLocked();
+    } else {
+      drawUnlocked();
+      unlockTime = millis();
+    }
+  }
+}
+
+//put value into the packet and send via ESPNOW
+void sendDoorState() {
+  outgoingPacket.doorLocked = doorLocked;
+  esp_err_t res = esp_now_send(peerAddress, (uint8_t *)&outgoingPacket, sizeof(outgoingPacket));
+  if (res != ESP_OK) {
+    Serial.printf("Error", res);
+  }
+}
+
+
+//Function to put the ESP and the LCD into sleep mode
+void deepSleep() {
+  // Turn off backlight
+  pinMode(45, OUTPUT);
+  digitalWrite(45, LOW);
+  // Allow TP_INT to wake ESP
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)TP_INT, 0);
+  lcd.powerSaveOn();
+  lcd.sleep();
+  delay(50);
+  esp_deep_sleep_start();
+}
+
+
+
+void setup() {
+  Serial.begin(115200);
+    while (!Serial);
+  
+  delay(10);
+
+  //If the ESP has been taken out of deep sleep, set the lcd using init_without_reset()(function from LGFX library)
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    lcd.init_without_reset();
+  } else { //initialize if not
+    lcd.init();
+  }
+  // make LCD horizontal and draw the lock screen as default
+  lcd.setRotation(1);
+  drawLocked();
+  pinMode(45, OUTPUT);
+  digitalWrite(45, HIGH);
+
+  pinMode(TP_INT, INPUT);
+
+  //Setup the touch interrupt I2C connection
+  if (!tp.begin(Wire, FT6X36_SLAVE_ADDRESS, TP_SDA, TP_SCL)) {
+      Serial.println("FT6X36 init failed!");
+      while (1) delay(1000);
+  }
+
+  tp.interruptPolling();
+
+  //begin the interrupt for the touch screen and start the counter for when the last time the LCD was touched
+  attachInterruptArg(TP_INT, touch_isr, NULL, FALLING);
+  lastTouchTime = millis();
+
+
+  //Setup the ESPNOW
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+  } else {
+    esp_now_register_send_cb(onDataSent);
+    esp_now_register_recv_cb(onDataRecv);
+    // add peer
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, peerAddress, 6);
+    peerInfo.channel = 1; // set channel same on both devices
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("Failed to add peer");
+    }
+  }
+
+  //Serial.print("My MAC: ");
+  //Serial.println(WiFi.macAddress());
+
+}
+
+void loop() {
+
+  if (touchIRQ) {
+      touchIRQ = false;
+      //getting the value at which the touchscreen was touched
+      int16_t x[1], y[1];
+      uint8_t touched = tp.getPoint(x, y, 1);
+      if (touched) {
+          //update the lastTouchTime
+          lastTouchTime = millis();
+          //If the touch screen is touched within the right bounds either lock or unlock the door and update the door state to send to other ESP
+          if ((x[0] > 50) && (x[0] < 170) && (y[0] > 40) && (y[0] < 440)) {
+              doorLocked = !doorLocked;
+              if (doorLocked){
+                  drawLocked();
+              }else{
+                drawUnlocked();
+                unlockTime = millis();
+              }
+
+            sendDoorState(); 
+            delay(600);
+          }
+      }
+  }
+  //if the door is unlocked and the 
+  if (!doorLocked) {
+        if (millis() - unlockTime >= AUTOLOCK_DELAY) {
+            doorLocked = true;
+            drawLocked();
+            sendDoorState();
+        }
+    }
+  // if the lastTouchTime is above 30 seconds, enter deepSleep mode
+  if (millis() - lastTouchTime > sleep_timeout) {
+      deepSleep();
+  }
+  delay(10);
+}
