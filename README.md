@@ -9,7 +9,7 @@ Team Members:
 1. Project Overview - What our project does
 
 Our project is a smart door auto-locker designed to automatically lock and unlock an apartment’s deadbolt without requiring any modification to the existing lock hardware.
-Unlike commercial smart locks that require uninstalling the original deadbolt, our solution is fully externalnand quickly installable. 
+Unlike commercial smart locks that require uninstalling the original deadbolt, our solution is fully external and quickly installable. 
 The device sits on top of the deadbolt and physically rotates it using a servo motor controlled by an ESP32.
 
 The user can lock or unlock the door using:
